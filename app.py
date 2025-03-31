@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import json
+import re
 
 st.title("IndexedDB Stock Data Viewer")
 st.write("View stock data stored in your browser's IndexedDB")
@@ -19,12 +20,12 @@ if st.button("Retrieve Data"):
             let date, close, high, low, open, volume;
             
             if (typeof item.data === 'string') {{
-                // Parse string format
+                // Parse string format with proper regex
                 const dateMatch = item.data.match(/Date['"][ ,:]+'([^']+)'/);
-                const closeMatch = item.data.match(/Close['"][ ,:]+([\d.]+)/);
-                const highMatch = item.data.match(/High['"][ ,:]+([\d.]+)/);
-                const lowMatch = item.data.match(/Low['"][ ,:]+([\d.]+)/);
-                const openMatch = item.data.match(/Open['"][ ,:]+([\d.]+)/);
+                const closeMatch = item.data.match(/Close['"][ ,:]+([\\d.]+)/);
+                const highMatch = item.data.match(/High['"][ ,:]+([\\d.]+)/);
+                const lowMatch = item.data.match(/Low['"][ ,:]+([\\d.]+)/);
+                const openMatch = item.data.match(/Open['"][ ,:]+([\\d.]+)/);
                 
                 date = dateMatch ? dateMatch[1] : item.date;
                 close = closeMatch ? parseFloat(closeMatch[1]) : null;
@@ -95,12 +96,11 @@ if st.button("Retrieve Data"):
             }});
             
             // Send data back to Streamlit
-            const outData = {{
+            window.parent.postMessage({{
                 isWidget: true,
                 type: "streamlit:setComponentValue",
                 value: jsonData
-            }};
-            window.parent.postMessage(outData, "*");
+            }}, "*");
         }})
         .catch(error => {{
             const jsonError = JSON.stringify({{
@@ -108,12 +108,11 @@ if st.button("Retrieve Data"):
                 status: "error"
             }});
             
-            const outError = {{
+            window.parent.postMessage({{
                 isWidget: true,
                 type: "streamlit:setComponentValue",
                 value: jsonError
-            }};
-            window.parent.postMessage(outError, "*");
+            }}, "*");
         }});
     </script>
     """
@@ -122,81 +121,65 @@ if st.button("Retrieve Data"):
     results_placeholder = st.empty()
     results_placeholder.write("Retrieving data...")
 
-    # Create the component
+    # Create the component and handle response
     response = st.components.v1.html(
         retrieve_component,
         height=0,
         key=f"retrieve_{symbol_to_retrieve}"
     )
 
-    # Handle the response via session state
-    if st.session_state.get("indexeddb_data"):
-        data = st.session_state.indexeddb_data
-        if data.get("status") == "success":
-            df = pd.DataFrame(data["data"])
+    # Handle the response when it arrives
+    if response:
+        try:
+            if isinstance(response, str):
+                data = json.loads(response)
+            else:
+                data = response
             
-            # Convert and sort dates
-            if 'Date' in df.columns:
-                df['Date'] = pd.to_datetime(df['Date'])
-                df = df.sort_values('Date')
-            
-            # Display results
-            results_placeholder.empty()
-            st.subheader(f"Retrieved {len(df)} records for {data['symbol']}")
-            st.dataframe(df)
-            
-            # Show chart
-            if 'Close' in df.columns:
-                st.line_chart(df.set_index('Date')['Close'])
-            
-            # Download button
-            csv = df.to_csv(index=False)
-            st.download_button(
-                label="Download as CSV",
-                data=csv,
-                file_name=f"{data['symbol']}_stock_data.csv",
-                mime="text/csv"
-            )
-        else:
-            results_placeholder.error(f"Error: {data.get('error', 'Unknown error')}")
-        
-        # Clear the session state
-        del st.session_state.indexeddb_data
+            if data.get("status") == "success":
+                df = pd.DataFrame(data["data"])
+                
+                # Convert and sort dates
+                if 'Date' in df.columns:
+                    df['Date'] = pd.to_datetime(df['Date'])
+                    df = df.sort_values('Date')
+                
+                # Display results
+                results_placeholder.empty()
+                st.subheader(f"Retrieved {len(df)} records for {data['symbol']}")
+                st.dataframe(df)
+                
+                # Show chart
+                if 'Close' in df.columns:
+                    st.line_chart(df.set_index('Date')['Close'])
+                
+                # Download button
+                csv = df.to_csv(index=False)
+                st.download_button(
+                    label="Download as CSV",
+                    data=csv,
+                    file_name=f"{data['symbol']}_stock_data.csv",
+                    mime="text/csv"
+                )
+            else:
+                results_placeholder.error(f"Error: {data.get('error', 'Unknown error')}")
+        except Exception as e:
+            results_placeholder.error(f"Error processing data: {str(e)}")
 
-# JavaScript message handler
+# Add message handler for component communication
 message_handler = """
 <script>
 window.addEventListener("message", (event) => {
     if (event.data.type === "streamlit:setComponentValue") {
-        try {
-            const data = JSON.parse(event.data.value);
-            const outData = {
-                isWidget: true,
-                type: "streamlit:setComponentValue",
-                value: JSON.stringify(data)
-            };
-            window.parent.postMessage(outData, "*");
-        } catch (e) {
-            console.error("Error processing data:", e);
-        }
+        const outData = {
+            isWidget: true,
+            type: "streamlit:setComponentValue",
+            value: event.data.value
+        };
+        window.parent.postMessage(outData, "*");
     }
 });
 </script>
 """
 
-# Add the message handler to the page
 st.components.v1.html(message_handler, height=0)
-
-# Handle incoming messages in Python
-if st._runtime.exists():
-    from streamlit.runtime.scriptrunner import get_script_run_ctx
-    ctx = get_script_run_ctx()
-    if ctx and hasattr(ctx, "forward_msg_queue"):
-        for msg in ctx.forward_msg_queue:
-            if msg.type == "streamlit:setComponentValue":
-                try:
-                    data = json.loads(msg.value)
-                    st.session_state.indexeddb_data = data
-                    st.rerun()
-                except json.JSONDecodeError:
-                    pass
