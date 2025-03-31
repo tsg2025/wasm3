@@ -8,126 +8,195 @@ st.write("View stock data stored in your browser's IndexedDB")
 # Input for symbol to retrieve
 symbol_to_retrieve = st.text_input("Enter stock symbol to retrieve", value="AAPL").upper()
 
-# JavaScript component to retrieve and send data
-retrieve_component = f"""
-<script>
-async function retrieveStockData(symbol) {{
-    return new Promise((resolve, reject) => {{
-        const request = indexedDB.open("StockDatabase", 2);
-        
-        request.onsuccess = function(event) {{
-            const db = event.target.result;
-            const transaction = db.transaction(["stockData"], "readonly");
-            const objectStore = transaction.objectStore("stockData");
-            const index = objectStore.index("symbol");
-            const getRequest = index.getAll(IDBKeyRange.only(symbol));
+if st.button("Retrieve Data"):
+    # JavaScript component to retrieve and send data
+    retrieve_component = f"""
+    <script>
+    // Function to process the unusual data format
+    function processStockRecord(item) {{
+        try {{
+            // Handle both object and string formats
+            let date, close, high, low, open, volume;
             
-            getRequest.onsuccess = function(event) {{
-                const results = event.target.result;
+            if (typeof item.data === 'string') {{
+                // Parse string format
+                const dateMatch = item.data.match(/Date['"][ ,:]+'([^']+)'/);
+                const closeMatch = item.data.match(/Close['"][ ,:]+([\d.]+)/);
+                const highMatch = item.data.match(/High['"][ ,:]+([\d.]+)/);
+                const lowMatch = item.data.match(/Low['"][ ,:]+([\d.]+)/);
+                const openMatch = item.data.match(/Open['"][ ,:]+([\d.]+)/);
                 
-                // Process the data - handle the unusual structure
-                const processedData = results.map(item => {{
-                    // Extract the numeric values from the string-like data
-                    const closeValue = item.data?.Close || 
-                                     (typeof item.data === 'string' ? parseFloat(item.data.match(/Close['"], 'AAPL'}}: ([\d.]+)/)?.[1]) : null);
-                    
-                    const dateValue = item.data?.Date || 
-                                    (typeof item.data === 'string' ? item.data.match(/Date['"], '}}: '([\d-]+)/)?.[1] : null);
-                    
-                    return {{
-                        Date: dateValue || item.date,
-                        Symbol: item.symbol,
-                        Close: closeValue,
-                        // Add other fields if available
-                        High: item.data?.High || null,
-                        Low: item.data?.Low || null,
-                        Open: item.data?.Open || null,
-                        Volume: item.data?.Volume || null
-                    }};
-                }}).filter(item => item.Close); // Only include records with valid Close prices
-                
-                resolve(processedData);
-            }};
-            
-            getRequest.onerror = function(event) {{
-                reject("Error retrieving data: " + event.target.error);
-            }};
-        }};
-        
-        request.onerror = function(event) {{
-            reject("Database error: " + event.target.error);
-        }};
-    }});
-}}
-
-async function sendData() {{
-    const symbol = "{symbol_to_retrieve}";
-    try {{
-        const data = await retrieveStockData(symbol);
-        window.parent.postMessage({{
-            type: "streamlit:setComponentValue",
-            value: {{
-                data: data,
-                symbol: symbol,
-                status: "success"
+                date = dateMatch ? dateMatch[1] : item.date;
+                close = closeMatch ? parseFloat(closeMatch[1]) : null;
+                high = highMatch ? parseFloat(highMatch[1]) : null;
+                low = lowMatch ? parseFloat(lowMatch[1]) : null;
+                open = openMatch ? parseFloat(openMatch[1]) : null;
+            }} else {{
+                // Handle object format
+                date = item.data?.Date || item.date;
+                close = item.data?.Close || null;
+                high = item.data?.High || null;
+                low = item.data?.Low || null;
+                open = item.data?.Open || null;
+                volume = item.data?.Volume || null;
             }}
-        }}, "*");
-    }} catch (error) {{
-        window.parent.postMessage({{
-            type: "streamlit:setComponentValue",
-            value: {{
+            
+            return {{
+                Date: date,
+                Symbol: item.symbol,
+                Close: close,
+                High: high,
+                Low: low,
+                Open: open,
+                Volume: volume
+            }};
+        }} catch (e) {{
+            console.error("Error processing record:", e);
+            return null;
+        }}
+    }}
+
+    async function retrieveStockData(symbol) {{
+        return new Promise((resolve, reject) => {{
+            const request = indexedDB.open("StockDatabase", 2);
+            
+            request.onsuccess = function(event) {{
+                const db = event.target.result;
+                const transaction = db.transaction(["stockData"], "readonly");
+                const objectStore = transaction.objectStore("stockData");
+                const index = objectStore.index("symbol");
+                const getRequest = index.getAll(IDBKeyRange.only(symbol));
+                
+                getRequest.onsuccess = function(event) {{
+                    const results = event.target.result
+                        .map(processStockRecord)
+                        .filter(item => item && item.Close);
+                    resolve(results);
+                }};
+                
+                getRequest.onerror = function(event) {{
+                    reject("Error retrieving data: " + event.target.error);
+                }};
+            }};
+            
+            request.onerror = function(event) {{
+                reject("Database error: " + event.target.error);
+            }};
+        }});
+    }}
+
+    // Send data to Streamlit
+    retrieveStockData("{symbol_to_retrieve}")
+        .then(data => {{
+            const jsonData = JSON.stringify({{
+                data: data,
+                symbol: "{symbol_to_retrieve}",
+                status: "success"
+            }});
+            
+            // Send data back to Streamlit
+            const outData = {{
+                isWidget: true,
+                type: "streamlit:setComponentValue",
+                value: jsonData
+            }};
+            window.parent.postMessage(outData, "*");
+        }})
+        .catch(error => {{
+            const jsonError = JSON.stringify({{
                 error: error.toString(),
                 status: "error"
-            }}
-        }}, "*");
-    }}
-}}
+            }});
+            
+            const outError = {{
+                isWidget: true,
+                type: "streamlit:setComponentValue",
+                value: jsonError
+            }};
+            window.parent.postMessage(outError, "*");
+        }});
+    </script>
+    """
 
-// Run when component loads
-sendData();
+    # Create a placeholder for results
+    results_placeholder = st.empty()
+    results_placeholder.write("Retrieving data...")
+
+    # Create the component
+    response = st.components.v1.html(
+        retrieve_component,
+        height=0,
+        key=f"retrieve_{symbol_to_retrieve}"
+    )
+
+    # Handle the response via session state
+    if st.session_state.get("indexeddb_data"):
+        data = st.session_state.indexeddb_data
+        if data.get("status") == "success":
+            df = pd.DataFrame(data["data"])
+            
+            # Convert and sort dates
+            if 'Date' in df.columns:
+                df['Date'] = pd.to_datetime(df['Date'])
+                df = df.sort_values('Date')
+            
+            # Display results
+            results_placeholder.empty()
+            st.subheader(f"Retrieved {len(df)} records for {data['symbol']}")
+            st.dataframe(df)
+            
+            # Show chart
+            if 'Close' in df.columns:
+                st.line_chart(df.set_index('Date')['Close'])
+            
+            # Download button
+            csv = df.to_csv(index=False)
+            st.download_button(
+                label="Download as CSV",
+                data=csv,
+                file_name=f"{data['symbol']}_stock_data.csv",
+                mime="text/csv"
+            )
+        else:
+            results_placeholder.error(f"Error: {data.get('error', 'Unknown error')}")
+        
+        # Clear the session state
+        del st.session_state.indexeddb_data
+
+# JavaScript message handler
+message_handler = """
+<script>
+window.addEventListener("message", (event) => {
+    if (event.data.type === "streamlit:setComponentValue") {
+        try {
+            const data = JSON.parse(event.data.value);
+            const outData = {
+                isWidget: true,
+                type: "streamlit:setComponentValue",
+                value: JSON.stringify(data)
+            };
+            window.parent.postMessage(outData, "*");
+        } catch (e) {
+            console.error("Error processing data:", e);
+        }
+    }
+});
 </script>
 """
 
-# Create component and handle response
-response = st.components.v1.html(retrieve_component, height=0)
+# Add the message handler to the page
+st.components.v1.html(message_handler, height=0)
 
-if response:
-    try:
-        # Parse the response
-        if isinstance(response, str):
-            response = json.loads(response)
-        
-        if response.get("status") == "success":
-            data = response.get("data", [])
-            symbol = response.get("symbol", "")
-            
-            if data:
-                df = pd.DataFrame(data)
-                
-                # Convert Date column to datetime and sort
-                if 'Date' in df.columns:
-                    df['Date'] = pd.to_datetime(df['Date'])
-                    df = df.sort_values('Date')
-                
-                # Display results
-                st.subheader(f"Retrieved {len(df)} records for {symbol}")
-                st.dataframe(df)
-                
-                # Show chart if we have Close prices
-                if 'Close' in df.columns:
-                    st.line_chart(df.set_index('Date')['Close'])
-                
-                # Add download button
-                csv = df.to_csv(index=False)
-                st.download_button(
-                    label="Download as CSV",
-                    data=csv,
-                    file_name=f"{symbol}_stock_data.csv",
-                    mime="text/csv"
-                )
-            else:
-                st.warning(f"No valid data found in IndexedDB for symbol {symbol}")
-        else:
-            st.error(f"Error retrieving data: {response.get('error', 'Unknown error')}")
-    except Exception as e:
-        st.error(f"Error processing response: {str(e)}")
+# Handle incoming messages in Python
+if st._runtime.exists():
+    from streamlit.runtime.scriptrunner import get_script_run_ctx
+    ctx = get_script_run_ctx()
+    if ctx and hasattr(ctx, "forward_msg_queue"):
+        for msg in ctx.forward_msg_queue:
+            if msg.type == "streamlit:setComponentValue":
+                try:
+                    data = json.loads(msg.value)
+                    st.session_state.indexeddb_data = data
+                    st.rerun()
+                except json.JSONDecodeError:
+                    pass
