@@ -6,6 +6,10 @@ import re
 st.title("IndexedDB Stock Data Viewer")
 st.write("View stock data stored in your browser's IndexedDB")
 
+# Store retrieved data in session state
+if 'stock_data' not in st.session_state:
+    st.session_state.stock_data = None
+
 # Input for symbol to retrieve
 symbol_to_retrieve = st.text_input("Enter stock symbol to retrieve", value="AAPL").upper()
 
@@ -117,69 +121,73 @@ if st.button("Retrieve Data"):
     </script>
     """
 
-    # Create a placeholder for results
-    results_placeholder = st.empty()
-    results_placeholder.write("Retrieving data...")
+    # Create the component without the key parameter
+    st.components.v1.html(retrieve_component, height=0)
 
-    # Create the component and handle response
-    response = st.components.v1.html(
-        retrieve_component,
-        height=0,
-        key=f"retrieve_{symbol_to_retrieve}"
-    )
-
-    # Handle the response when it arrives
-    if response:
-        try:
-            if isinstance(response, str):
-                data = json.loads(response)
-            else:
-                data = response
-            
-            if data.get("status") == "success":
-                df = pd.DataFrame(data["data"])
-                
-                # Convert and sort dates
-                if 'Date' in df.columns:
-                    df['Date'] = pd.to_datetime(df['Date'])
-                    df = df.sort_values('Date')
-                
-                # Display results
-                results_placeholder.empty()
-                st.subheader(f"Retrieved {len(df)} records for {data['symbol']}")
-                st.dataframe(df)
-                
-                # Show chart
-                if 'Close' in df.columns:
-                    st.line_chart(df.set_index('Date')['Close'])
-                
-                # Download button
-                csv = df.to_csv(index=False)
-                st.download_button(
-                    label="Download as CSV",
-                    data=csv,
-                    file_name=f"{data['symbol']}_stock_data.csv",
-                    mime="text/csv"
-                )
-            else:
-                results_placeholder.error(f"Error: {data.get('error', 'Unknown error')}")
-        except Exception as e:
-            results_placeholder.error(f"Error processing data: {str(e)}")
-
-# Add message handler for component communication
+# Message handler to process responses
 message_handler = """
 <script>
 window.addEventListener("message", (event) => {
     if (event.data.type === "streamlit:setComponentValue") {
-        const outData = {
+        window.parent.postMessage({
             isWidget: true,
             type: "streamlit:setComponentValue",
             value: event.data.value
-        };
-        window.parent.postMessage(outData, "*");
+        }, "*");
     }
 });
 </script>
 """
 
+# Add the message handler
 st.components.v1.html(message_handler, height=0)
+
+# Check for incoming messages
+if st.session_state.stock_data is None:
+    st.write("No data retrieved yet. Click 'Retrieve Data' to fetch from IndexedDB.")
+else:
+    if st.session_state.stock_data.get("status") == "success":
+        data = st.session_state.stock_data["data"]
+        df = pd.DataFrame(data)
+        
+        # Convert and sort dates
+        if 'Date' in df.columns:
+            df['Date'] = pd.to_datetime(df['Date'])
+            df = df.sort_values('Date')
+        
+        # Display results
+        st.subheader(f"Retrieved {len(df)} records for {st.session_state.stock_data['symbol']}")
+        st.dataframe(df)
+        
+        # Show chart
+        if 'Close' in df.columns:
+            st.line_chart(df.set_index('Date')['Close'])
+        
+        # Download button
+        csv = df.to_csv(index=False)
+        st.download_button(
+            label="Download as CSV",
+            data=csv,
+            file_name=f"{st.session_state.stock_data['symbol']}_stock_data.csv",
+            mime="text/csv"
+        )
+    else:
+        st.error(f"Error: {st.session_state.stock_data.get('error', 'Unknown error')}")
+
+# Handle component messages in Python
+try:
+    from streamlit.runtime.scriptrunner import RerunData, RerunException
+    from streamlit.source_util import get_pages
+    
+    ctx = st.runtime.scriptrunner.get_script_run_ctx()
+    if ctx:
+        for msg in ctx.forward_msg_queue:
+            if msg.type == "streamlit:setComponentValue":
+                try:
+                    data = json.loads(msg.value)
+                    st.session_state.stock_data = data
+                    raise RerunException(RerunData(widget_states=None))
+                except json.JSONDecodeError:
+                    pass
+except Exception:
+    pass
