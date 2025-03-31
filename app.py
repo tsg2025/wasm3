@@ -1,7 +1,6 @@
 import streamlit as st
 import pandas as pd
 import json
-from datetime import datetime
 
 st.title("IndexedDB Stock Data Viewer")
 st.write("View stock data stored in your browser's IndexedDB")
@@ -12,45 +11,55 @@ symbol_to_retrieve = st.text_input("Enter stock symbol to retrieve", value="AAPL
 # JavaScript component to retrieve and send data
 retrieve_component = f"""
 <script>
-// Function to retrieve data from IndexedDB
 async function retrieveStockData(symbol) {{
     return new Promise((resolve, reject) => {{
-        let db;
         const request = indexedDB.open("StockDatabase", 2);
         
-        request.onerror = (event) => {{
-            reject("Database error: " + event.target.error);
-        }};
-        
-        request.onsuccess = (event) => {{
-            db = event.target.result;
+        request.onsuccess = function(event) {{
+            const db = event.target.result;
             const transaction = db.transaction(["stockData"], "readonly");
             const objectStore = transaction.objectStore("stockData");
             const index = objectStore.index("symbol");
             const getRequest = index.getAll(IDBKeyRange.only(symbol));
             
-            getRequest.onerror = (event) => {{
-                reject("Error retrieving data: " + event.target.error);
+            getRequest.onsuccess = function(event) {{
+                const results = event.target.result;
+                
+                // Process the data - handle the unusual structure
+                const processedData = results.map(item => {{
+                    // Extract the numeric values from the string-like data
+                    const closeValue = item.data?.Close || 
+                                     (typeof item.data === 'string' ? parseFloat(item.data.match(/Close['"], 'AAPL'}}: ([\d.]+)/)?.[1]) : null);
+                    
+                    const dateValue = item.data?.Date || 
+                                    (typeof item.data === 'string' ? item.data.match(/Date['"], '}}: '([\d-]+)/)?.[1] : null);
+                    
+                    return {{
+                        Date: dateValue || item.date,
+                        Symbol: item.symbol,
+                        Close: closeValue,
+                        // Add other fields if available
+                        High: item.data?.High || null,
+                        Low: item.data?.Low || null,
+                        Open: item.data?.Open || null,
+                        Volume: item.data?.Volume || null
+                    }};
+                }}).filter(item => item.Close); // Only include records with valid Close prices
+                
+                resolve(processedData);
             }};
             
-            getRequest.onsuccess = (event) => {{
-                const results = event.target.result.map(item => ({{
-                    ...item.data,
-                    Date: item.date,
-                    Symbol: item.symbol
-                }}));
-                resolve(results);
+            getRequest.onerror = function(event) {{
+                reject("Error retrieving data: " + event.target.error);
             }};
         }};
         
-        request.onupgradeneeded = (event) => {{
-            // Database doesn't exist or needs upgrade
-            resolve([]);
+        request.onerror = function(event) {{
+            reject("Database error: " + event.target.error);
         }};
     }});
 }}
 
-// Main function to handle communication with Streamlit
 async function sendData() {{
     const symbol = "{symbol_to_retrieve}";
     try {{
@@ -95,7 +104,7 @@ if response:
             if data:
                 df = pd.DataFrame(data)
                 
-                # Convert Date column to datetime
+                # Convert Date column to datetime and sort
                 if 'Date' in df.columns:
                     df['Date'] = pd.to_datetime(df['Date'])
                     df = df.sort_values('Date')
@@ -117,16 +126,8 @@ if response:
                     mime="text/csv"
                 )
             else:
-                st.warning(f"No data found in IndexedDB for symbol {symbol}")
+                st.warning(f"No valid data found in IndexedDB for symbol {symbol}")
         else:
             st.error(f"Error retrieving data: {response.get('error', 'Unknown error')}")
     except Exception as e:
         st.error(f"Error processing response: {str(e)}")
-
-# Add some instructions
-st.markdown("""
-### Notes:
-1. Data must have been previously stored using the uploader tool
-2. Only shows data from the current browser (IndexedDB is browser-specific)
-3. Data persists until browser cache is cleared
-""")
