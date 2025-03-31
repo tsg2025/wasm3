@@ -2,157 +2,234 @@ import streamlit as st
 import pandas as pd
 import yfinance as yf
 from datetime import datetime, timedelta
+import json
 import base64
-from io import StringIO
 
-# Streamlit app title and description
-st.title("Yahoo Finance to IndexedDB (WASM) Uploader")
+# Streamlit app config
+st.set_page_config(layout="wide", page_title="Stock Data Manager")
+st.title("📈 Multi-Symbol Stock Data Storage (IndexedDB)")
 st.write("""
-Download stock data from Yahoo Finance and store it in the browser's IndexedDB.
-The data will persist in the user's browser.
+Download stock data from Yahoo Finance and store it efficiently in IndexedDB.
+Optimized for fast retrieval when working with many symbols.
 """)
 
-# User inputs
-col1, col2 = st.columns(2)
-with col1:
-    symbol = st.text_input("Stock Symbol", value="AAPL").upper()
-with col2:
-    days = st.number_input("Days of History", min_value=1, max_value=365*5, value=30)
+# ======================
+# DATA DOWNLOAD SECTION
+# ======================
+st.sidebar.header("Download Settings")
+symbol = st.sidebar.text_input("Symbol(s) (comma-separated)", "AAPL,MSFT,TSLA").upper()
+days = st.sidebar.number_input("Days of History", 1, 365*10, 365)
+interval = st.sidebar.selectbox("Interval", ["1d", "1wk", "1mo"], index=0)
 
-if st.button("Download and Store Data"):
-    try:
-        # Calculate date range
-        end_date = datetime.today()
-        start_date = end_date - timedelta(days=days)
-        
-        # Download data from Yahoo Finance
-        with st.spinner(f"Downloading {symbol} data from Yahoo Finance..."):
-            df = yf.download(symbol, start=start_date, end=end_date)
-        
-        if df.empty:
-            st.error("No data found for this symbol/time period")
-            st.stop()
-        
-        # Reset index to make Date a column
-        df = df.reset_index()
-        df['Date'] = df['Date'].dt.strftime('%Y-%m-%d')
-        
-        # Display preview
-        st.subheader(f"{symbol} Data Preview ({len(df)} records)")
-        st.write(df.head())
-        
-        # Convert DataFrame to JSON
-        data_json = df.to_json(orient='records')
-        
-        # Create JavaScript code to store in IndexedDB
-        js_code = f"""
-        <script>
-        // Initialize IndexedDB
-        let db;
-        const request = indexedDB.open("StockDatabase", 2);  // Version 2
-        
-        request.onerror = function(event) {{
-            console.log("Database error: " + event.target.errorCode);
-        }};
-        
-        request.onupgradeneeded = function(event) {{
-            db = event.target.result;
-            // Delete old object store if it exists
-            if (db.objectStoreNames.contains("stockData")) {{
-                db.deleteObjectStore("stockData");
-            }}
-            const objectStore = db.createObjectStore("stockData", {{ keyPath: "id", autoIncrement: true }});
-            objectStore.createIndex("symbol", "symbol", {{ unique: false }});
-            objectStore.createIndex("date", "date", {{ unique: false }});
-            console.log("Database setup complete");
-        }};
-        
-        request.onsuccess = function(event) {{
-            db = event.target.result;
-            console.log("Database opened successfully");
+def download_data(symbols, days, interval):
+    """Download and flatten stock data"""
+    end_date = datetime.today()
+    start_date = end_date - timedelta(days=days)
+    
+    data = []
+    for sym in [s.strip() for s in symbols.split(",")]:
+        try:
+            df = yf.download(sym, start=start_date, end=end_date, interval=interval)
+            if df.empty:
+                continue
+                
+            df = df.reset_index()
+            df['symbol'] = sym
+            df['date'] = df['Date'].dt.strftime('%Y-%m-%d')
+            df = df.drop(columns=['Date'])
             
-            // Clear existing data for this symbol
-            const transaction = db.transaction(["stockData"], "readwrite");
-            const objectStore = transaction.objectStore("stockData");
-            const index = objectStore.index("symbol");
-            const clearRequest = index.openCursor(IDBKeyRange.only("{symbol}"));
+            # Convert numpy types to native Python for JSON serialization
+            data.extend(df.to_dict('records'))
+        except Exception as e:
+            st.error(f"Failed to download {sym}: {str(e)}")
+    
+    return data
+
+# ======================
+# INDEXEDDB SECTION
+# ======================
+def generate_js_code(data, symbols):
+    """Generate optimized IndexedDB JavaScript"""
+    return f"""
+    <script>
+    const symbols = {json.dumps([s.strip() for s in symbols.split(",")])};
+    const stockData = {json.dumps(data)};
+    
+    const request = indexedDB.open("StockDB", 4);
+    
+    // Database schema setup
+    request.onupgradeneeded = (event) => {{
+        const db = event.target.result;
+        
+        // Delete old store if exists
+        if (db.objectStoreNames.contains("stocks")) {{
+            db.deleteObjectStore("stocks");
+        }}
+        
+        // Create optimized store with composite key
+        const store = db.createObjectStore("stocks", {{
+            keyPath: ["symbol", "date"]
+        }});
+        
+        // Create indexes for common queries
+        store.createIndex("symbol", "symbol");
+        store.createIndex("date", "date");
+        store.createIndex("close", "close");
+        store.createIndex("volume", "volume");
+        store.createIndex("symbol_date", ["symbol", "date"], {{ unique: true }});
+    }};
+    
+    request.onsuccess = (event) => {{
+        const db = event.target.result;
+        
+        // Batch process symbols for efficient updates
+        symbols.forEach(symbol => {{
+            const tx = db.transaction("stocks", "readwrite");
+            const store = tx.objectStore("stocks");
             
-            let recordsToDelete = [];
-            clearRequest.onsuccess = function(event) {{
-                const cursor = event.target.result;
-                if (cursor) {{
-                    recordsToDelete.push(cursor.value.id);
-                    cursor.continue();
-                }} else {{
-                    // Delete all matching records
-                    if (recordsToDelete.length > 0) {{
-                        const deleteTransaction = db.transaction(["stockData"], "readwrite");
-                        const deleteStore = deleteTransaction.objectStore("stockData");
-                        
-                        recordsToDelete.forEach(id => {{
-                            deleteStore.delete(id);
-                        }});
-                        
-                        deleteTransaction.oncomplete = function() {{
-                            console.log(`Deleted ${{recordsToDelete.length}} old records for {symbol}`);
-                            addNewData();
-                        }};
-                    }} else {{
-                        addNewData();
-                    }}
-                }}
+            // Efficient range delete for symbol
+            const deleteRange = IDBKeyRange.bound(
+                [symbol, "0000-00-00"],
+                [symbol, "9999-99-99"]
+            );
+            
+            store.delete(deleteRange).onsuccess = () => {{
+                // Insert new data in bulk
+                const symbolData = stockData.filter(d => d.symbol === symbol);
+                symbolData.forEach(item => store.put(item));
             }};
-            
-            function addNewData() {{
-                // Add new data
-                const data = {data_json};
-                const addTransaction = db.transaction(["stockData"], "readwrite");
-                const addStore = addTransaction.objectStore("stockData");
-                
-                data.forEach(item => {{
-                    // Add symbol to each record for filtering
-                    const record = {{
-                        symbol: "{symbol}",
-                        date: item.Date,
-                        data: item
-                    }};
-                    addStore.add(record);
-                }});
-                
-                addTransaction.oncomplete = function() {{
-                    console.log("All data added successfully");
-                    alert(`${{data.length}} {symbol} records stored in IndexedDB successfully!`);
-                }};
-            }}
-        }};
-        </script>
-        """
+        }});
         
-        # Display success message
-        st.success(f"{symbol} data downloaded and processed successfully!")
-        
-        # Execute the JavaScript
-        st.components.v1.html(js_code, height=0)
-        
-        # Download link for the data (optional)
-        csv = df.to_csv(index=False)
-        b64 = base64.b64encode(csv.encode()).decode()
-        href = f'<a href="data:file/csv;base64,{b64}" download="{symbol}_stock_data.csv">Download {symbol} CSV</a>'
-        st.markdown(href, unsafe_allow_html=True)
-        
-    except Exception as e:
-        st.error(f"An error occurred: {str(e)}")
+        // Report completion
+        Promise.all(
+            Array.from(db.transaction("stocks").objectStore("stocks").getAll().onsuccess
+        ).then(() => {{
+            console.log("Data update complete");
+            alert(`Success! ${{stockData.length}} records stored for ${{symbols.join(", ")}}`);
+        }});
+    }};
+    
+    request.onerror = (event) => {{
+        console.error("Database error:", event.target.error);
+        alert("Database error occurred - check console");
+    }};
+    </script>
+    """
 
-# Add instructions
+# ======================
+# STREAMLIT UI
+# ======================
+if st.sidebar.button("💾 Download & Store Data"):
+    with st.spinner(f"Downloading {symbol} data..."):
+        data = download_data(symbol, days, interval)
+        
+    if not data:
+        st.error("No data downloaded - check symbols/parameters")
+        st.stop()
+        
+    st.success(f"Downloaded {len(data)} records")
+    
+    # Preview data
+    st.subheader("Data Preview")
+    st.dataframe(pd.DataFrame(data).head(10))
+    
+    # Generate and inject JavaScript
+    js_code = generate_js_code(data, symbol)
+    st.components.v1.html(js_code, height=0)
+    
+    # CSV download option
+    csv = pd.DataFrame(data).to_csv(index=False)
+    b64 = base64.b64encode(csv.encode()).decode()
+    href = f'<a href="data:file/csv;base64,{b64}" download="stock_data.csv">💾 Download CSV</a>'
+    st.markdown(href, unsafe_allow_html=True)
+
+# ======================
+# QUERY INTERFACE
+# ======================
+st.sidebar.header("Query Data")
+query_symbol = st.sidebar.text_input("Filter Symbol", "AAPL").upper()
+min_close = st.sidebar.number_input("Minimum Close Price", value=0.0)
+
+query_js = f"""
+<script>
+async function queryData() {{
+    const db = await new Promise((resolve, reject) => {{
+        const request = indexedDB.open("StockDB", 4);
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
+    }});
+    
+    const tx = db.transaction("stocks", "readonly");
+    const store = tx.objectStore("stocks");
+    const index = store.index("symbol");
+    
+    // Create query range
+    const range = IDBKeyRange.only("{query_symbol}");
+    const records = await new Promise((resolve, reject) => {{
+        const request = index.getAll(range);
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
+    }});
+    
+    // Filter by close price if specified
+    const filtered = records.filter(r => r.close >= {min_close});
+    
+    // Send back to Streamlit
+    window.parent.postMessage({{
+        type: "queryResult",
+        data: filtered
+    }}, "*");
+}}
+
+queryData();
+</script>
+"""
+
+if st.sidebar.button("🔍 Run Query"):
+    st.subheader(f"Query Results for {query_symbol}")
+    result_placeholder = st.empty()
+    
+    # JavaScript to Python communication
+    query_result_js = """
+    <script>
+    window.addEventListener("message", (event) => {
+        if (event.data.type === "queryResult") {
+            window.parent.postMessage({
+                type: "streamlit:setComponentValue",
+                value: JSON.stringify(event.data.data)
+            }, "*");
+        }
+    });
+    </script>
+    """
+    
+    # Combined JS execution
+    st.components.v1.html(query_js + query_result_js, height=0)
+    
+    # Handle results (via Streamlit's custom component handling)
+    try:
+        query_result = st.session_state.get("query_result")
+        if query_result:
+            df = pd.DataFrame(json.loads(query_result))
+            result_placeholder.dataframe(df)
+    except:
+        pass
+
+# Instructions
 st.markdown("""
-### Instructions:
-1. Enter a stock symbol (e.g., AAPL, MSFT, TSLA)
-2. Select how many days of historical data you want
-3. Click "Download and Store Data"
-4. The data will be saved in your browser's IndexedDB
+## 📖 Usage Guide
+1. **Download Data**  
+   - Enter symbols (comma-separated)
+   - Set time period and interval
+   - Click "Download & Store Data"
 
-### Notes:
-- Data persists in your browser until you clear site data
-- You can retrieve this data later from any page on this domain
-- Uses Yahoo Finance API via yfinance Python package
+2. **Query Data**  
+   - Filter by symbol and minimum close price
+   - Click "Run Query"
+
+## ⚡ Optimizations
+- **Composite Keys**: Fast symbol+date lookups
+- **Bulk Operations**: Efficient updates/deletes
+- **Indexed Fields**: Close price, volume queries
+- **Batch Processing**: Handles many symbols smoothly
 """)
