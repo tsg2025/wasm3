@@ -1,84 +1,89 @@
 import streamlit as st
 import pandas as pd
+import base64
+from io import StringIO
 
-st.title("CSV to IndexedDB (Confirmed Working)")
+# Streamlit app title and description
+st.title("CSV to IndexedDB (WASM) Uploader")
 st.write("""
-This is the minimal working version that verifies storage.
+Upload a CSV file to store it in the browser's IndexedDB using WebAssembly.
+The data will persist in the user's browser.
 """)
 
+# File upload section
 uploaded_file = st.file_uploader("Choose a CSV file", type="csv")
 
 if uploaded_file is not None:
     try:
+        # Read the CSV file
         df = pd.read_csv(uploaded_file)
+        
+        # Display preview
         st.subheader("Data Preview")
         st.write(df.head())
         
+        # Convert DataFrame to JSON
         data_json = df.to_json(orient='records')
         
+        # Create JavaScript code to store in IndexedDB
         js_code = f"""
         <script>
-        // 1. Open database
-        const request = indexedDB.open("CSV_Database", 1);
+        // Initialize IndexedDB
+        let db;
+        const request = indexedDB.open("CSVDatabase", 1);
         
-        // 2. Create store if needed
-        request.onupgradeneeded = (event) => {{
-            const db = event.target.result;
-            db.createObjectStore("csv_data", {{ autoIncrement: true }});
+        request.onerror = function(event) {{
+            console.log("Database error: " + event.target.errorCode);
         }};
         
-        // 3. Store data when DB is ready
-        request.onsuccess = (event) => {{
-            const db = event.target.result;
-            const tx = db.transaction("csv_data", "readwrite");
-            const store = tx.objectStore("csv_data");
+        request.onupgradeneeded = function(event) {{
+            db = event.target.result;
+            const objectStore = db.createObjectStore("csvData", {{ keyPath: "id", autoIncrement: true }});
+            objectStore.createIndex("data", "data", {{ unique: false }});
+            console.log("Database setup complete");
+        }};
+        
+        request.onsuccess = function(event) {{
+            db = event.target.result;
+            console.log("Database opened successfully");
             
-            // Clear old data
-            store.clear().onsuccess = () => {{
+            // Clear existing data
+            const transaction = db.transaction(["csvData"], "readwrite");
+            const objectStore = transaction.objectStore("csvData");
+            const clearRequest = objectStore.clear();
+            
+            clearRequest.onsuccess = function() {{
+                console.log("Old data cleared");
+                
                 // Add new data
                 const data = {data_json};
-                store.add(data);
+                const addTransaction = db.transaction(["csvData"], "readwrite");
+                const addStore = addTransaction.objectStore("csvData");
                 
-                // VERIFICATION - Immediately read back
-                store.getAll().onsuccess = (e) => {{
-                    const savedData = e.target.result[0];
-                    console.log("Stored data verified:", savedData);
-                    alert(`Success! Stored ${{savedData.length}} records`);
-                    
-                    // Send verification to Streamlit
-                    window.parent.postMessage({{
-                        type: "STORAGE_VERIFIED",
-                        rowCount: savedData.length,
-                        firstRecord: savedData[0]
-                    }}, "*");
+                data.forEach(item => {{
+                    addStore.add({{data: item}});
+                }});
+                
+                addTransaction.oncomplete = function() {{
+                    console.log("All data added successfully");
+                    alert("Data stored in IndexedDB successfully! Total records: " + data.length);
                 }};
             }};
         }};
         </script>
         """
         
+        # Display success message
+        st.success("CSV file processed successfully!")
+        
+        # Execute the JavaScript
         st.components.v1.html(js_code, height=0)
-        st.success("Data processing complete!")
+        
+        # Download link for the data (optional)
+        csv = df.to_csv(index=False)
+        b64 = base64.b64encode(csv.encode()).decode()
+        href = f'<a href="data:file/csv;base64,{b64}" download="processed_data.csv">Download Processed CSV</a>'
+        st.markdown(href, unsafe_allow_html=True)
         
     except Exception as e:
-        st.error(f"Error: {str(e)}")
-
-# Verification message handler
-st.components.v1.html("""
-<script>
-window.addEventListener('message', (event) => {
-    if (event.data.type === "STORAGE_VERIFIED") {
-        console.log("Storage confirmed:", event.data);
-    }
-});
-</script>
-""", height=0)
-
-st.markdown("""
-### How to verify:
-1. Open browser console (F12)
-2. Check:
-   - "Application" → IndexedDB → "CSV_Database"
-   - Console logs will show the stored data
-3. You'll see an alert with the row count
-""")
+        st.error(f"An error occurred: {str(e)}")
