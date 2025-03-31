@@ -6,60 +6,67 @@ import json
 import uuid
 
 # Streamlit app configuration
-st.set_page_config(page_title="CSV to IndexedDB WASM", layout="wide")
+st.set_page_config(page_title="CSV to IndexedDB", layout="wide")
 
-# HTML/JS template for IndexedDB operations
+# HTML/JS template with complete IndexedDB implementation
 indexeddb_js = """
 <script>
-// IndexedDB setup
+// Global database reference
 let db;
-const dbName = "CSV_DB";
-const storeName = "csv_store";
 
-// Open or create IndexedDB
-const request = indexedDB.open(dbName, 1);
+// Open or create the database
+const request = indexedDB.open("CSV_Database", 1);
 
 request.onupgradeneeded = function(event) {
     db = event.target.result;
-    if (!db.objectStoreNames.contains(storeName)) {
-        db.createObjectStore(storeName, { keyPath: "id" });
+    // Create object store if it doesn't exist
+    if (!db.objectStoreNames.contains("csv_data")) {
+        const store = db.createObjectStore("csv_data", { keyPath: "id" });
+        console.log("Created new object store");
     }
-    console.log("Database upgraded");
 };
 
 request.onsuccess = function(event) {
     db = event.target.result;
     console.log("Database opened successfully");
+    // Notify Streamlit that we're ready
+    window.parent.postMessage({
+        type: "DB_READY",
+        status: "success"
+    }, "*");
 };
 
 request.onerror = function(event) {
     console.error("Database error:", event.target.error);
+    window.parent.postMessage({
+        type: "DB_ERROR",
+        error: event.target.error
+    }, "*");
 };
 
-// Function to store data in IndexedDB
-function storeDataInIndexedDB(data, filename) {
+// Store data in IndexedDB
+function storeCSVData(data, filename) {
     return new Promise((resolve, reject) => {
         if (!db) {
             reject("Database not initialized");
             return;
         }
 
-        const transaction = db.transaction(storeName, "readwrite");
-        const store = transaction.objectStore(storeName);
+        const transaction = db.transaction("csv_data", "readwrite");
+        const store = transaction.objectStore("csv_data");
         
         const record = {
-            id: Date.now().toString() + "_" + Math.random().toString(36).substr(2, 9),
+            id: Date.now().toString() + "_" + Math.random().toString(36).substr(2, 5),
             filename: filename,
             data: data,
-            timestamp: new Date().toISOString(),
-            size: JSON.stringify(data).length
+            timestamp: new Date().toISOString()
         };
 
         const request = store.add(record);
 
         request.onsuccess = function() {
             console.log("Data stored successfully");
-            resolve(true);
+            resolve(record.id);
         };
 
         request.onerror = function(event) {
@@ -69,32 +76,60 @@ function storeDataInIndexedDB(data, filename) {
     });
 }
 
-// Listen for messages from Streamlit
-window.addEventListener('message', (event) => {
-    if (event.data.type === 'STORE_CSV') {
-        const { data, filename } = event.data;
-        storeDataInIndexedDB(data, filename)
-            .then(() => {
-                // Send success message back to Streamlit
-                window.parent.postMessage({
-                    type: 'STORAGE_SUCCESS',
-                    message: 'Data stored in IndexedDB successfully'
-                }, '*');
-            })
-            .catch(error => {
-                window.parent.postMessage({
-                    type: 'STORAGE_ERROR',
-                    message: 'Failed to store data: ' + error
-                }, '*');
-            });
+// Retrieve all data from IndexedDB
+function getAllCSVData() {
+    return new Promise((resolve, reject) => {
+        if (!db) {
+            reject("Database not initialized");
+            return;
+        }
+
+        const transaction = db.transaction("csv_data", "readonly");
+        const store = transaction.objectStore("csv_data");
+        const request = store.getAll();
+
+        request.onsuccess = function() {
+            resolve(request.result);
+        };
+
+        request.onerror = function(event) {
+            reject(event.target.error);
+        };
+    });
+}
+
+// Message handler
+window.addEventListener("message", async (event) => {
+    if (event.data.type === "STORE_CSV") {
+        try {
+            const id = await storeCSVData(event.data.data, event.data.filename);
+            window.parent.postMessage({
+                type: "STORAGE_SUCCESS",
+                id: id,
+                filename: event.data.filename
+            }, "*");
+        } catch (error) {
+            window.parent.postMessage({
+                type: "STORAGE_ERROR",
+                error: error.toString()
+            }, "*");
+        }
+    }
+    else if (event.data.type === "GET_ALL_DATA") {
+        try {
+            const allData = await getAllCSVData();
+            window.parent.postMessage({
+                type: "ALL_DATA",
+                data: allData
+            }, "*");
+        } catch (error) {
+            window.parent.postMessage({
+                type: "DATA_ERROR",
+                error: error.toString()
+            }, "*");
+        }
     }
 });
-
-// Report when the script is loaded and ready
-window.parent.postMessage({
-    type: 'SCRIPT_READY',
-    message: 'IndexedDB script is ready'
-}, '*');
 </script>
 """
 
@@ -111,95 +146,80 @@ def download_csv_from_github(url):
         return None
 
 def main():
-    st.title("CSV to IndexedDB (WASM) Uploader")
+    st.title("CSV to IndexedDB Storage")
     
-    # Initialize session state for messages
-    if 'storage_message' not in st.session_state:
-        st.session_state.storage_message = None
+    # Initialize session state
+    if 'storage_status' not in st.session_state:
+        st.session_state.storage_status = None
+    if 'stored_data' not in st.session_state:
+        st.session_state.stored_data = None
     
-    # Display storage message if exists
-    if st.session_state.storage_message:
-        if st.session_state.storage_message['type'] == 'success':
-            st.success(st.session_state.storage_message['text'])
+    # Display status
+    if st.session_state.storage_status:
+        if st.session_state.storage_status['type'] == 'success':
+            st.success(st.session_state.storage_status['message'])
         else:
-            st.error(st.session_state.storage_message['text'])
+            st.error(st.session_state.storage_status['message'])
     
-    # Option 1: Upload CSV directly
-    st.header("Option 1: Upload CSV File")
-    uploaded_file = st.file_uploader("Choose a CSV file", type="csv")
+    # File upload section
+    st.header("Upload CSV File")
+    uploaded_file = st.file_uploader("Choose a CSV file", type=["csv", "txt"])
     
     if uploaded_file is not None:
         try:
-            # Read CSV file
             df = pd.read_csv(uploaded_file)
-            st.success("CSV file loaded successfully!")
+            st.success("CSV loaded successfully!")
             
-            # Show preview
             st.subheader("Data Preview")
-            st.write(df.head())
+            st.dataframe(df.head())
             
-            # Convert to JSON for sending to JS
-            csv_data = df.to_dict(orient='records')
+            # Convert to list of dictionaries for JSON serialization
+            data = df.to_dict(orient='records')
             
-            # Generate unique ID for this transaction
-            transaction_id = str(uuid.uuid4())
-            
-            # Send data to JS for IndexedDB storage
+            # Send to IndexedDB
             js_code = f"""
             <script>
                 window.postMessage({{
-                    type: 'STORE_CSV',
-                    data: {json.dumps(csv_data)},
-                    filename: "{uploaded_file.name}",
-                    transaction_id: "{transaction_id}"
-                }}, '*');
+                    type: "STORE_CSV",
+                    data: {json.dumps(data)},
+                    filename: "{uploaded_file.name}"
+                }}, "*");
             </script>
             """
             st.components.v1.html(js_code, height=0)
             
-            # Placeholder for storage status
             with st.spinner('Storing data in IndexedDB...'):
-                # We'd normally wait for a response here, but Streamlit makes this tricky
-                # In a production app, you'd use a more sophisticated message passing system
+                # We can't directly await the response in Streamlit's execution model
+                # So we'll use a placeholder and verify manually
                 pass
             
         except Exception as e:
-            st.error(f"Error processing CSV file: {e}")
+            st.error(f"Error processing file: {e}")
     
-    # Option 2: Load from GitHub URL
-    st.header("Option 2: Load CSV from GitHub")
-    github_url = st.text_input("Enter GitHub raw CSV URL (e.g., https://raw.githubusercontent.com/user/repo/branch/file.csv)")
+    # GitHub section
+    st.header("Load from GitHub")
+    github_url = st.text_input("Enter GitHub raw CSV URL")
     
     if github_url and st.button("Load from GitHub"):
         csv_content = download_csv_from_github(github_url)
         if csv_content:
             try:
-                # Read CSV content
                 df = pd.read_csv(StringIO(csv_content))
-                st.success("CSV file loaded from GitHub successfully!")
+                st.success("CSV loaded from GitHub successfully!")
                 
-                # Show preview
                 st.subheader("Data Preview")
-                st.write(df.head())
+                st.dataframe(df.head())
                 
-                # Get filename from URL
                 filename = github_url.split("/")[-1]
+                data = df.to_dict(orient='records')
                 
-                # Convert to JSON for sending to JS
-                csv_data = df.to_dict(orient='records')
-                
-                # Generate unique ID for this transaction
-                transaction_id = str(uuid.uuid4())
-                
-                # Send data to JS for IndexedDB storage
                 js_code = f"""
                 <script>
                     window.postMessage({{
-                        type: 'STORE_CSV',
-                        data: {json.dumps(csv_data)},
-                        filename: "{filename}",
-                        transaction_id: "{transaction_id}"
-                    }}, '*');
+                        type: "STORE_CSV",
+                        data: {json.dumps(data)},
+                        filename: "{filename}"
+                    }}, "*");
                 </script>
                 """
                 st.components.v1.html(js_code, height=0)
@@ -208,33 +228,54 @@ def main():
                     pass
                 
             except Exception as e:
-                st.error(f"Error processing CSV content: {e}")
+                st.error(f"Error processing GitHub CSV: {e}")
     
-    # Instructions section
-    st.header("Instructions")
-    st.markdown("""
-    1. **Option 1**: Upload a CSV file directly using the file uploader
-    2. **Option 2**: Provide a GitHub raw CSV URL to load the file
-    3. The data will be stored in your browser's IndexedDB
-    4. Check browser console (F12) for storage logs
-    """)
-
-    # JavaScript to handle messages from the iframe
-    message_js = """
+    # Verification section
+    st.header("Verify Storage")
+    if st.button("Check IndexedDB Contents"):
+        js_code = """
+        <script>
+            window.postMessage({
+                type: "GET_ALL_DATA"
+            }, "*");
+        </script>
+        """
+        st.components.v1.html(js_code, height=0)
+        
+        with st.spinner('Checking IndexedDB...'):
+            # Placeholder - in a real app you'd await the response
+            st.info("Check your browser's console (F12) for IndexedDB contents")
+    
+    # JavaScript to handle messages from our IndexedDB operations
+    message_handler_js = """
     <script>
-    // Listen for messages from the iframe
     window.addEventListener('message', (event) => {
-        if (event.data.type === 'STORAGE_SUCCESS') {
-            console.log('Storage success:', event.data.message);
-        } else if (event.data.type === 'STORAGE_ERROR') {
-            console.error('Storage error:', event.data.message);
-        } else if (event.data.type === 'SCRIPT_READY') {
-            console.log(event.data.message);
+        if (event.data.type === "STORAGE_SUCCESS") {
+            console.log('Storage successful:', event.data);
+        }
+        else if (event.data.type === "STORAGE_ERROR") {
+            console.error('Storage error:', event.data);
+        }
+        else if (event.data.type === "ALL_DATA") {
+            console.log('All IndexedDB data:', event.data.data);
+        }
+        else if (event.data.type === "DATA_ERROR") {
+            console.error('Data retrieval error:', event.data);
         }
     });
     </script>
     """
-    st.components.v1.html(message_js, height=0)
+    st.components.v1.html(message_handler_js, height=0)
+    
+    # Debug instructions
+    st.header("Debugging Instructions")
+    st.markdown("""
+    1. Open browser developer tools (F12)
+    2. Go to the Application tab
+    3. Under IndexedDB, look for "CSV_Database"
+    4. Check the Console tab for operation logs
+    5. Click "Check IndexedDB Contents" to verify storage
+    """)
 
 if __name__ == "__main__":
     main()
